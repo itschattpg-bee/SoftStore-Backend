@@ -1,6 +1,7 @@
 const bcrypt = require("bcryptjs");
 const User = require("../models/User");
 const { signToken } = require("../utils/jwt");
+const { fileToDataUri } = require("../utils/imageEncoding");
 
 const SALT_ROUNDS = 10;
 
@@ -33,15 +34,16 @@ async function register(req, res) {
 
     const passwordHash = await bcrypt.hash(password, SALT_ROUNDS);
 
-    // multer (uploadPhoto.single("photo")) puts the saved file on req.file
-    const photoPath = req.file ? `/uploads/photos/${req.file.filename}` : null;
+    // multer (uploadPhoto.single("photo")) now uses memory storage —
+    // req.file has a .buffer, no .filename/.path.
+    const photoDataUri = fileToDataUri(req.file);
 
     const user = await User.create({
       name,
       username: username.toLowerCase(),
       email: email.toLowerCase(),
       passwordHash,
-      photo: photoPath,
+      photo: photoDataUri,
     });
 
     const token = signToken(user._id);

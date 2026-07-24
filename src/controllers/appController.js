@@ -1,10 +1,7 @@
-const fs = require("fs");
 const path = require("path");
 const App = require("../models/App");
-const User = require("../models/User");
-const { uploadReleaseAsset } = require("../services/githubService");
+const { publishAppRelease } = require("../services/githubService");
 const { formatBytes } = require("../utils/formatBytes");
-const { UPLOADS_ROOT } = require("../middleware/upload");
 
 /** Shapes an App document (with developer populated) for API responses. */
 function toAppJSON(app) {
@@ -36,9 +33,10 @@ function toAppJSON(app) {
 /**
  * POST /api/apps — create a new app listing.
  * Expects multipart/form-data: name, description, repoLink, icon (file),
- * appFile (file, .apk/.zip). The appFile is pushed into the developer's
- * own GitHub repo (via their connected OAuth token) instead of being
- * stored on our server — GitHub's raw content URL becomes fileUrl.
+ * appFile (file, .apk/.zip). Both files are pushed into the developer's
+ * own GitHub repo as assets on a single release (via their connected
+ * OAuth token) — nothing is stored on our own server, so this works fine
+ * on hosts with an ephemeral filesystem like Render.
  */
 async function createApp(req, res) {
   try {
@@ -47,73 +45,51 @@ async function createApp(req, res) {
     const appFile = req.files?.appFile?.[0];
 
     if (!name || !description || !repoLink) {
-      return res.status(400).json({
-        message: "name, description and repoLink are all required",
-      });
+      return res
+        .status(400)
+        .json({ message: "name, description and repoLink are all required" });
     }
-
-    if (!iconFile)
-      return res.status(400).json({ message: "icon image is required" });
-
-    if (!appFile)
-      return res.status(400).json({ message: "appFile is required" });
+    if (!iconFile) return res.status(400).json({ message: "icon image is required" });
+    if (!appFile) return res.status(400).json({ message: "appFile (.apk or .zip) is required" });
 
     const developer = req.user;
-
     if (!developer.github?.connected || !developer.github?.accessToken) {
       return res.status(400).json({
-        message: "Connect your GitHub account first.",
+        message:
+          "Connect a GitHub account first (see GET /api/users/me/github/connect) — app files are stored in your GitHub repo.",
       });
     }
 
-    const iconDir = path.join(UPLOADS_ROOT, "icons");
-    if (!fs.existsSync(iconDir))
-      fs.mkdirSync(iconDir, { recursive: true });
-
     const iconExt = path.extname(iconFile.originalname) || ".jpg";
-    const iconFilename =
-      `${Date.now()}-${Math.round(Math.random() * 1e9)}${iconExt}`;
+    const iconUploadName = `icon-${Date.now()}${iconExt}`;
+    const appUploadName = `${Date.now()}-${appFile.originalname}`;
 
-    fs.writeFileSync(
-      path.join(iconDir, iconFilename),
-      iconFile.buffer
-    );
-
-    const iconPath = `/uploads/icons/${iconFilename}`;
-
-    const { downloadUrl } = await uploadReleaseAsset({
+    const { iconUrl, fileUrl } = await publishAppRelease({
       accessToken: developer.github.accessToken,
       repoLink,
-      fileBuffer: appFile.buffer,
-      fileName: `${Date.now()}-${appFile.originalname}`,
-      releaseNotes: description,
+      iconBuffer: iconFile.buffer,
+      iconFileName: iconUploadName,
+      appBuffer: appFile.buffer,
+      appFileName: appUploadName,
+      releaseNotes: `${description}\n\nPublished via SoftStore.`,
     });
 
     const app = await App.create({
       name,
       description,
-      icon: iconPath,
+      icon: iconUrl,
       repoLink,
-      fileUrl: downloadUrl,
+      fileUrl,
       fileName: appFile.originalname,
       sizeBytes: appFile.buffer.length,
       developer: developer._id,
     });
 
     await app.populate("developer");
-
     res.status(201).json(toAppJSON(app));
-
   } catch (err) {
-    console.log("========== CREATE APP ERROR ==========");
-    console.log("Message:", err.message);
-    console.log("Status:", err.response?.status);
-    console.log("URL:", err.config?.url);
-    console.log("Response:", err.response?.data);
-
-    res.status(500).json({
-      message: err.message,
-    });
+    console.error("createApp error:", err.message);
+    res.status(500).json({ message: err.message || "Failed to create app" });
   }
 }
 
@@ -164,9 +140,9 @@ async function downloadApp(req, res) {
 
 /**
  * DELETE /api/apps/:id — removes an app listing. Only the developer who
- * published it can delete it. This only removes our DB record and the
- * locally-hosted icon; the actual release/asset stays on GitHub since
- * that's the developer's own repo, not something we manage.
+ * published it can delete it. This only removes our DB record — the
+ * actual release/assets stay on GitHub since that's the developer's own
+ * repo, not something we manage.
  */
 async function deleteApp(req, res) {
   const app = await App.findById(req.params.id);
@@ -174,13 +150,6 @@ async function deleteApp(req, res) {
 
   if (app.developer.toString() !== req.user._id.toString()) {
     return res.status(403).json({ message: "You can only delete your own apps" });
-  }
-
-  // Best-effort cleanup of the locally-stored icon file — an upload
-  // failure here shouldn't block the actual delete.
-  if (app.icon) {
-    const iconPath = path.join(UPLOADS_ROOT, app.icon.replace(/^\/uploads\//, ""));
-    fs.unlink(iconPath, () => {});
   }
 
   await App.findByIdAndDelete(req.params.id);

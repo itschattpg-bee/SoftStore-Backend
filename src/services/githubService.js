@@ -111,6 +111,67 @@ async function uploadFileToRepo({ accessToken, repoLink, filePath, fileBuffer, c
 }
 
 /**
+ * Creates one GitHub release and uploads both the app icon and the
+ * APK/ZIP to it as separate assets — so the developer's repo ends up
+ * with a single release containing everything for that version (matches
+ * how the actual Play Store bundles an icon alongside the binary).
+ * Returns the public download URL for each.
+ */
+async function publishAppRelease({
+  accessToken,
+  repoLink,
+  iconBuffer,
+  iconFileName,
+  appBuffer,
+  appFileName,
+  releaseNotes,
+}) {
+  const { owner, repo } = parseRepoLink(repoLink);
+  const headers = {
+    Authorization: `Bearer ${accessToken}`,
+    Accept: "application/vnd.github+json",
+  };
+
+  // Unique tag so repeat uploads never collide with an existing release.
+  const tagName = `softstore-${Date.now()}`;
+
+  const release = await axios.post(
+    `https://api.github.com/repos/${owner}/${repo}/releases`,
+    {
+      tag_name: tagName,
+      name: appFileName,
+      body: releaseNotes || "Published via SoftStore",
+      draft: false,
+      prerelease: false,
+    },
+    { headers }
+  );
+
+  // upload_url comes back as a URI template, e.g.
+  // "https://uploads.github.com/repos/owner/repo/releases/123/assets{?name,label}"
+  const uploadUrlBase = release.data.upload_url.split("{")[0];
+
+  async function uploadAsset(buffer, fileName) {
+    const uploadUrl = `${uploadUrlBase}?name=${encodeURIComponent(fileName)}`;
+    const asset = await axios.post(uploadUrl, buffer, {
+      headers: {
+        ...headers,
+        "Content-Type": "application/octet-stream",
+        "Content-Length": buffer.length,
+      },
+      maxBodyLength: Infinity,
+      maxContentLength: Infinity,
+    });
+    return asset.data.browser_download_url;
+  }
+
+  const iconUrl = await uploadAsset(iconBuffer, iconFileName);
+  const fileUrl = await uploadAsset(appBuffer, appFileName);
+
+  return { iconUrl, fileUrl, htmlUrl: release.data.html_url };
+}
+
+/**
  * Uploads the app binary as a GitHub **Release asset** instead of a
  * regular committed file. The Contents API used above caps out at 100MB
  * and can't be raised — Releases support assets up to 2GB, which is what
@@ -119,74 +180,51 @@ async function uploadFileToRepo({ accessToken, repoLink, filePath, fileBuffer, c
  * Each upload creates its own release (unique tag per upload), then
  * attaches the binary to it. Returns the asset's public download URL,
  * same shape as uploadFileToRepo so callers don't need to change.
+ *
+ * Kept for backwards compatibility — createApp now uses
+ * publishAppRelease instead, since it needs to upload the icon too.
  */
-async function uploadReleaseAsset({
-  accessToken,
-  repoLink,
-  fileBuffer,
-  fileName,
-  releaseNotes,
-}) {
+async function uploadReleaseAsset({ accessToken, repoLink, fileBuffer, fileName, releaseNotes }) {
   const { owner, repo } = parseRepoLink(repoLink);
-
-  console.log("========== GITHUB UPLOAD ==========");
-  console.log("Owner:", owner);
-  console.log("Repo:", repo);
-  console.log("Repo Link:", repoLink);
-
   const headers = {
     Authorization: `Bearer ${accessToken}`,
     Accept: "application/vnd.github+json",
   };
 
+  // Unique tag so repeat uploads never collide with an existing release.
   const tagName = `softstore-${Date.now()}`;
 
-  try {
-    console.log("Creating GitHub release...");
+  const release = await axios.post(
+    `https://api.github.com/repos/${owner}/${repo}/releases`,
+    {
+      tag_name: tagName,
+      name: fileName,
+      body: releaseNotes || "Published via SoftStore",
+      draft: false,
+      prerelease: false,
+    },
+    { headers }
+  );
 
-    const release = await axios.post(
-      `https://api.github.com/repos/${owner}/${repo}/releases`,
-      {
-        tag_name: tagName,
-        name: fileName,
-        body: releaseNotes || "Published via SoftStore",
-        draft: false,
-        prerelease: false,
-      },
-      { headers }
-    );
+  // upload_url comes back as a URI template, e.g.
+  // "https://uploads.github.com/repos/owner/repo/releases/123/assets{?name,label}"
+  const uploadUrl =
+    release.data.upload_url.split("{")[0] + `?name=${encodeURIComponent(fileName)}`;
 
-    console.log("Release created:", release.data.id);
+  const asset = await axios.post(uploadUrl, fileBuffer, {
+    headers: {
+      ...headers,
+      "Content-Type": "application/octet-stream",
+      "Content-Length": fileBuffer.length,
+    },
+    maxBodyLength: Infinity,
+    maxContentLength: Infinity,
+  });
 
-    const uploadUrl =
-      release.data.upload_url.split("{")[0] +
-      `?name=${encodeURIComponent(fileName)}`;
-
-    console.log("Upload URL:", uploadUrl);
-
-    const asset = await axios.post(uploadUrl, fileBuffer, {
-      headers: {
-        ...headers,
-        "Content-Type": "application/octet-stream",
-        "Content-Length": fileBuffer.length,
-      },
-      maxBodyLength: Infinity,
-      maxContentLength: Infinity,
-    });
-
-    console.log("Asset uploaded successfully");
-
-    return {
-      downloadUrl: asset.data.browser_download_url,
-      htmlUrl: release.data.html_url,
-    };
-  } catch (err) {
-    console.log("========== GITHUB ERROR ==========");
-    console.log("Status:", err.response?.status);
-    console.log("URL:", err.config?.url);
-    console.log("Response:", err.response?.data);
-    throw err;
-  }
+  return {
+    downloadUrl: asset.data.browser_download_url,
+    htmlUrl: release.data.html_url,
+  };
 }
 
 module.exports = {
@@ -196,4 +234,5 @@ module.exports = {
   parseRepoLink,
   uploadFileToRepo,
   uploadReleaseAsset,
+  publishAppRelease,
 };

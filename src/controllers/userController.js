@@ -7,6 +7,7 @@ const {
   getGithubUser,
 } = require("../services/githubService");
 const { JWT_SECRET } = require("../utils/jwt");
+const { fileToDataUri } = require("../utils/imageEncoding");
 
 async function withAppsCount(user) {
   const appsCount = await App.countDocuments({ developer: user._id });
@@ -51,7 +52,7 @@ async function updateMe(req, res) {
     }
 
     if (req.file) {
-      user.photo = `/uploads/photos/${req.file.filename}`;
+      user.photo = fileToDataUri(req.file);
     }
 
     await user.save();

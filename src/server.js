@@ -16,8 +16,11 @@ app.use(morgan("dev"));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Serves uploaded profile photos & app icons, e.g.
-// GET /uploads/icons/169999-abc.png
+// Legacy-only: older records created before photos/icons moved to
+// MongoDB (base64) and GitHub releases may still reference a local
+// /uploads/... path. Harmless to keep — just 404s if the file isn't
+// there, which it usually won't be on hosts with an ephemeral disk
+// (like Render) after a restart.
 app.use("/uploads", express.static(path.join(__dirname, "..", "uploads")));
 
 app.get("/api/health", (req, res) => res.json({ ok: true }));
