@@ -78,6 +78,20 @@ settings, if you want GitHub connect to work from the device too).
 **App**
 - `name`, `description`, `icon`, `repoLink`, `fileUrl` (GitHub download
   URL), `fileName`, `sizeBytes`, `downloads`, `developer` (ref → User)
+- `category` — one of the fixed list in `src/constants/categories.js`
+  (`E-Commerce`, `Social & Communication`, `FinTech`, `EdTech`,
+  `Healthcare`, `Business & Productivity`). Required on upload; powers
+  both the home screen's category scroll and the upload form's dropdown.
+- `visibility` — `"public"` (default, shows in everyone's home feed) or
+  `"private"` (only ever shows up in its developer's own "Your Apps"
+  screen and download screen — a 404 for everyone else).
+- `screenshots` — array of GitHub release-asset URLs, uploaded the same
+  way as the icon. Shown on the download screen, Play-Store style.
+
+**Review** (new)
+- `app` (ref → App), `user` (ref → User), `rating` (1–5), `comment`
+- One review per user per app — leaving a review again just edits your
+  existing one instead of creating a duplicate.
 
 ## 6. API reference
 
@@ -102,27 +116,76 @@ register/login.
 ### Apps
 | Method | Route | Auth | Notes |
 |---|---|---|---|
-| GET | `/api/apps?search=term` | – | home feed, newest first, name search |
-| GET | `/api/apps/mine` | ✅ | apps you've published |
-| POST | `/api/apps` | ✅ | multipart: `name, description, repoLink, icon (file), appFile (file)` — requires GitHub connected first |
-| GET | `/api/apps/:id` | – | single app, for the download screen |
+| GET | `/api/apps?search=term&category=term` | – | home feed, **public apps only**, newest first, optional name search + exact category filter |
+| GET | `/api/apps/categories` | – | the fixed list of category strings, for the dropdown/scroll |
+| GET | `/api/apps/mine` | ✅ | every app you've published, public **and** private |
+| POST | `/api/apps` | ✅ | multipart: `name, description, category, visibility? ("public"|"private", default public), repoLink, icon (file), appFile (file), screenshots (files, up to 6, optional)` — requires GitHub connected first |
+| GET | `/api/apps/:id` | optional | single app, for the download screen. If the app is private, only its developer (when logged in) gets it — everyone else gets a 404 |
 | GET | `/api/apps/:id/download` | – | increments the counter, 302-redirects to the GitHub file |
+| DELETE | `/api/apps/:id` | ✅ | developer-only |
 
 Every app response includes a populated `developer` object
-(`name, username, photo, verified`) and a human-readable `size` string
-alongside the raw `sizeBytes`.
+(`name, username, photo, verified`), a human-readable `size` string
+alongside the raw `sizeBytes`, and `avgRating` / `reviewsCount` rolled up
+from that app's reviews.
 
-## 7. Typical upload flow (client-side)
+### Reviews
+| Method | Route | Auth | Notes |
+|---|---|---|---|
+| GET | `/api/apps/:id/reviews` | – | every review for the app, newest first |
+| POST | `/api/apps/:id/reviews` | ✅ | json/form: `{ rating: 1-5, comment }` — leaves your review, or edits it if you already left one |
+| DELETE | `/api/apps/:id/reviews` | ✅ | removes your own review |
+
+### Images
+| Method | Route | Auth | Notes |
+|---|---|---|---|
+| GET | `/api/images/proxy?url=<encoded GitHub asset URL>` | – | streams the image back with an open CORS header — see "Why the image proxy exists" below |
+
+## 7. Why the image proxy exists (the web image bug)
+
+Icons and screenshots are stored as GitHub release assets, and the app
+just used their raw `github.com` / `objects.githubusercontent.com` URLs
+directly. That's fine on Android/iOS, but **Flutter Web's CanvasKit
+renderer fetches network images itself (via `fetch`/XHR) instead of
+dropping a plain `<img>` tag on the page**, and GitHub's asset hosts
+don't send back an `Access-Control-Allow-Origin` header — so the browser
+silently blocks the response and the image never renders. That was the
+"web version can't load images" bug.
+
+The fix: the server never hands the client a raw GitHub URL anymore.
+`toAppJSON` rewrites `icon` and every entry in `screenshots` through
+`utils/mediaUrl.js`, which turns them into a relative path like
+`/api/images/proxy?url=<encoded original>`. The Flutter app already
+prefixes any relative path with its API base URL (see
+`ApiService.mediaUrl`), so **no client changes were needed for this
+fix** — it "just works" once the backend is updated. `imageController.js`
+fetches the real image server-side (plain server-to-server HTTP, no
+CORS involved) and re-serves it with `Access-Control-Allow-Origin: *`.
+Only GitHub's own hosts are allowed through the proxy (see
+`ALLOWED_HOSTS`), so it can't be used as an open relay.
+
+Profile photos are unaffected — those are stored as base64 `data:` URIs
+directly on the User document, which never touch the network in the
+first place and so were never subject to this bug.
+
+## 8. Typical upload flow (client-side)
 
 1. User registers/logs in → gets a JWT.
 2. User taps "Connect GitHub" on their profile → `GET /api/users/me/github/connect`
    → open the returned URL → user authorizes → GitHub hits our callback →
    `github.connected` becomes `true`.
-3. User fills out the upload form (icon, name, description, repo link,
-   `.apk`/`.zip`) → `POST /api/apps` → we push the file into their repo and
-   save the listing.
-4. Home screen calls `GET /api/apps` and shows every app from everyone,
-   filtered live as they type in the search box.
-5. Tapping an app calls `GET /api/apps/:id` to render the download screen,
+3. User fills out the upload form (icon, name, description, category,
+   public/private, repo link, `.apk`/`.zip`, optional screenshots) →
+   `POST /api/apps` → we push every file into their repo (as assets on
+   one release) and save the listing.
+4. Home screen calls `GET /api/apps` and shows every **public** app from
+   everyone, filtered live as they type in the search box and/or tap a
+   category chip.
+5. Tapping an app calls `GET /api/apps/:id` to render the download
+   screen (screenshots gallery, about, about the developer, reviews),
    and the Download button hits `GET /api/apps/:id/download`, which
    redirects straight to the file on GitHub.
+6. On that same screen, anyone logged in can call
+   `POST /api/apps/:id/reviews` to leave a star rating + comment, and
+   `GET /api/apps/:id/reviews` powers the list shown under the
+   screenshots/about-the-developer section.

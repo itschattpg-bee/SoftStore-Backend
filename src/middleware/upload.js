@@ -15,16 +15,17 @@ const uploadPhoto = multer({
   limits: { fileSize: 5 * 1024 * 1024 }, // 5 MB
 });
 
-// App creation needs two files at once — an icon image and the APK/ZIP —
-// both come in as in-memory buffers. The controller pushes both into the
-// same GitHub release (via the developer's connected OAuth token), so
-// neither ever touches our own disk.
+// App creation needs several files at once — an icon image, the
+// APK/ZIP, and (optionally) a handful of Play-Store-style screenshots —
+// all come in as in-memory buffers. The controller pushes all of them
+// into the same GitHub release (via the developer's connected OAuth
+// token), so none of it ever touches our own disk.
 const uploadAppAssets = multer({
   storage: multer.memoryStorage(),
   fileFilter: (req, file, cb) => {
-    if (file.fieldname === "icon") {
+    if (file.fieldname === "icon" || file.fieldname === "screenshots") {
       if (file.mimetype.startsWith("image/")) return cb(null, true);
-      return cb(new Error("icon must be an image file"));
+      return cb(new Error(`${file.fieldname} must be an image file`));
     }
     if (file.fieldname === "appFile") {
       const allowed = [".apk", ".zip"];
@@ -38,6 +39,7 @@ const uploadAppAssets = multer({
 }).fields([
   { name: "icon", maxCount: 1 },
   { name: "appFile", maxCount: 1 },
+  { name: "screenshots", maxCount: 6 },
 ]);
 
 module.exports = { uploadPhoto, uploadAppAssets };

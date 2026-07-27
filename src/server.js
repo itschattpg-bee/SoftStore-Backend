@@ -8,6 +8,7 @@ const connectDB = require("./config/db");
 const authRoutes = require("./routes/authRoutes");
 const userRoutes = require("./routes/userRoutes");
 const appRoutes = require("./routes/appRoutes");
+const imageRoutes = require("./routes/imageRoutes");
 
 const app = express();
 
@@ -28,6 +29,7 @@ app.get("/api/health", (req, res) => res.json({ ok: true }));
 app.use("/api/auth", authRoutes);
 app.use("/api/users", userRoutes);
 app.use("/api/apps", appRoutes);
+app.use("/api/images", imageRoutes);
 
 // Multer / general error handler — so bad uploads return clean JSON
 // instead of an HTML stack trace.

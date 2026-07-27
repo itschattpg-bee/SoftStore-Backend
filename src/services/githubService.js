@@ -111,11 +111,11 @@ async function uploadFileToRepo({ accessToken, repoLink, filePath, fileBuffer, c
 }
 
 /**
- * Creates one GitHub release and uploads both the app icon and the
- * APK/ZIP to it as separate assets — so the developer's repo ends up
- * with a single release containing everything for that version (matches
- * how the actual Play Store bundles an icon alongside the binary).
- * Returns the public download URL for each.
+ * Creates one GitHub release and uploads the app icon, the APK/ZIP, and
+ * any screenshots to it as separate assets — so the developer's repo
+ * ends up with a single release containing everything for that version
+ * (matches how the actual Play Store bundles an icon + screenshots
+ * alongside the binary). Returns the public download URL for each.
  */
 async function publishAppRelease({
   accessToken,
@@ -124,6 +124,7 @@ async function publishAppRelease({
   iconFileName,
   appBuffer,
   appFileName,
+  screenshots, // optional: [{ buffer, fileName }, ...]
   releaseNotes,
 }) {
   const { owner, repo } = parseRepoLink(repoLink);
@@ -168,7 +169,15 @@ async function publishAppRelease({
   const iconUrl = await uploadAsset(iconBuffer, iconFileName);
   const fileUrl = await uploadAsset(appBuffer, appFileName);
 
-  return { iconUrl, fileUrl, htmlUrl: release.data.html_url };
+  // Screenshots upload one at a time (GitHub releases don't support
+  // uploading assets in parallel to the same release reliably).
+  const screenshotUrls = [];
+  for (const shot of screenshots || []) {
+    const url = await uploadAsset(shot.buffer, shot.fileName);
+    screenshotUrls.push(url);
+  }
+
+  return { iconUrl, fileUrl, screenshotUrls, htmlUrl: release.data.html_url };
 }
 
 /**

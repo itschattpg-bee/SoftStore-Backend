@@ -1,4 +1,5 @@
 const mongoose = require("mongoose");
+const { CATEGORIES } = require("../constants/categories");
 
 const appSchema = new mongoose.Schema(
   {
@@ -11,10 +12,31 @@ const appSchema = new mongoose.Schema(
       type: String,
       required: true,
     },
+    // One of the fixed CATEGORIES — powers the home screen's horizontal
+    // category scroll and the upload form's category dropdown.
+    category: {
+      type: String,
+      required: true,
+      enum: CATEGORIES,
+    },
+    // "public" apps show up in everyone's home feed; "private" apps only
+    // ever show up in their own developer's "Your Apps" screen.
+    visibility: {
+      type: String,
+      enum: ["public", "private"],
+      default: "public",
+    },
     // Path (served from /uploads/icons/...) to the app icon.
     icon: {
       type: String,
       required: true,
+    },
+    // Play-Store-style screenshots the developer uploaded, shown on the
+    // download screen above "About the developer". Same storage story as
+    // the icon — each one is a GitHub release asset URL.
+    screenshots: {
+      type: [String],
+      default: [],
     },
     // The GitHub repo the developer gave us, e.g. https://github.com/owner/repo
     repoLink: {

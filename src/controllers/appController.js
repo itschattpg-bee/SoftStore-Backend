@@ -1,22 +1,61 @@
 const path = require("path");
 const App = require("../models/App");
+const Review = require("../models/Review");
 const { publishAppRelease } = require("../services/githubService");
 const { formatBytes } = require("../utils/formatBytes");
+const { toProxiedUrl, toProxiedUrls } = require("../utils/mediaUrl");
+const { CATEGORIES } = require("../constants/categories");
+
+/**
+ * Looks up { avgRating, reviewsCount } for one or more app ids in a
+ * single aggregation query, so list endpoints don't need one query per
+ * app. Returns a Map keyed by the app id string.
+ */
+async function loadReviewStats(appIds) {
+  if (!appIds.length) return new Map();
+  const rows = await Review.aggregate([
+    { $match: { app: { $in: appIds } } },
+    {
+      $group: {
+        _id: "$app",
+        avgRating: { $avg: "$rating" },
+        reviewsCount: { $sum: 1 },
+      },
+    },
+  ]);
+  const map = new Map();
+  for (const row of rows) {
+    map.set(row._id.toString(), {
+      avgRating: Math.round(row.avgRating * 10) / 10,
+      reviewsCount: row.reviewsCount,
+    });
+  }
+  return map;
+}
 
 /** Shapes an App document (with developer populated) for API responses. */
-function toAppJSON(app) {
+function toAppJSON(app, reviewStats) {
   const dev = app.developer;
+  const stats = reviewStats?.get(app._id.toString()) || {
+    avgRating: 0,
+    reviewsCount: 0,
+  };
   return {
     id: app._id,
     name: app.name,
     description: app.description,
-    icon: app.icon,
+    category: app.category,
+    visibility: app.visibility,
+    icon: toProxiedUrl(app.icon),
+    screenshots: toProxiedUrls(app.screenshots),
     repoLink: app.repoLink,
     fileUrl: app.fileUrl,
     fileName: app.fileName,
     sizeBytes: app.sizeBytes,
     size: formatBytes(app.sizeBytes),
     downloads: app.downloads,
+    avgRating: stats.avgRating,
+    reviewsCount: stats.reviewsCount,
     createdAt: app.createdAt,
     developer: dev
       ? {
@@ -32,23 +71,36 @@ function toAppJSON(app) {
 
 /**
  * POST /api/apps — create a new app listing.
- * Expects multipart/form-data: name, description, repoLink, icon (file),
- * appFile (file, .apk/.zip). Both files are pushed into the developer's
- * own GitHub repo as assets on a single release (via their connected
- * OAuth token) — nothing is stored on our own server, so this works fine
- * on hosts with an ephemeral filesystem like Render.
+ * Expects multipart/form-data: name, description, category, visibility?,
+ * repoLink, icon (file), appFile (file), screenshots (files, up to 6).
+ * All image/binary assets are pushed into the developer's own GitHub
+ * repo as assets on a single release (via their connected OAuth token) —
+ * nothing is stored on our own server, so this works fine on hosts with
+ * an ephemeral filesystem like Render.
  */
 async function createApp(req, res) {
   try {
-    const { name, description, repoLink } = req.body;
+    const { name, description, repoLink, category } = req.body;
+    let { visibility } = req.body;
     const iconFile = req.files?.icon?.[0];
     const appFile = req.files?.appFile?.[0];
+    const screenshotFiles = req.files?.screenshots || [];
 
     if (!name || !description || !repoLink) {
       return res
         .status(400)
         .json({ message: "name, description and repoLink are all required" });
     }
+    if (!category || !CATEGORIES.includes(category)) {
+      return res.status(400).json({
+        message: `category is required and must be one of: ${CATEGORIES.join(", ")}`,
+      });
+    }
+    if (visibility && !["public", "private"].includes(visibility)) {
+      return res.status(400).json({ message: "visibility must be public or private" });
+    }
+    visibility = visibility || "public";
+
     if (!iconFile) return res.status(400).json({ message: "icon image is required" });
     if (!appFile) return res.status(400).json({ message: "appFile (.apk or .zip) is required" });
 
@@ -63,21 +115,29 @@ async function createApp(req, res) {
     const iconExt = path.extname(iconFile.originalname) || ".jpg";
     const iconUploadName = `icon-${Date.now()}${iconExt}`;
     const appUploadName = `${Date.now()}-${appFile.originalname}`;
+    const screenshotUploads = screenshotFiles.map((file, index) => ({
+      buffer: file.buffer,
+      fileName: `screenshot-${Date.now()}-${index}${path.extname(file.originalname) || ".jpg"}`,
+    }));
 
-    const { iconUrl, fileUrl } = await publishAppRelease({
+    const { iconUrl, fileUrl, screenshotUrls } = await publishAppRelease({
       accessToken: developer.github.accessToken,
       repoLink,
       iconBuffer: iconFile.buffer,
       iconFileName: iconUploadName,
       appBuffer: appFile.buffer,
       appFileName: appUploadName,
+      screenshots: screenshotUploads,
       releaseNotes: `${description}\n\nPublished via SoftStore.`,
     });
 
     const app = await App.create({
       name,
       description,
+      category,
+      visibility,
       icon: iconUrl,
+      screenshots: screenshotUrls,
       repoLink,
       fileUrl,
       fileName: appFile.originalname,
@@ -94,33 +154,52 @@ async function createApp(req, res) {
 }
 
 /**
- * GET /api/apps?search=... — the home feed: every app from every user,
- * newest first, optionally filtered by a case-insensitive name/description
- * match. This is what powers the home screen's search box.
+ * GET /api/apps?search=term&category=term — the home feed: every
+ * *public* app from every user, newest first, optionally filtered by a
+ * case-insensitive name match and/or an exact category match. This is
+ * what powers the home screen's search box and category scroll.
  */
 async function listApps(req, res) {
-  const { search } = req.query;
-  const filter = search
-    ? { name: { $regex: search, $options: "i" } }
-    : {};
+  const { search, category } = req.query;
+  const filter = { visibility: "public" };
+  if (search) filter.name = { $regex: search, $options: "i" };
+  if (category) filter.category = category;
 
   const apps = await App.find(filter).sort({ createdAt: -1 }).populate("developer");
-  res.json(apps.map(toAppJSON));
+  const reviewStats = await loadReviewStats(apps.map((a) => a._id));
+  res.json(apps.map((a) => toAppJSON(a, reviewStats)));
 }
 
-/** GET /api/apps/mine — apps uploaded by the logged-in user. */
+/** GET /api/apps/categories — the fixed list of category options. */
+function listCategories(req, res) {
+  res.json(CATEGORIES);
+}
+
+/** GET /api/apps/mine — every app uploaded by the logged-in user (public + private). */
 async function myApps(req, res) {
   const apps = await App.find({ developer: req.user._id })
     .sort({ createdAt: -1 })
     .populate("developer");
-  res.json(apps.map(toAppJSON));
+  const reviewStats = await loadReviewStats(apps.map((a) => a._id));
+  res.json(apps.map((a) => toAppJSON(a, reviewStats)));
 }
 
-/** GET /api/apps/:id — single app detail, used by the download screen. */
+/**
+ * GET /api/apps/:id — single app detail, used by the download screen.
+ * Public apps are visible to anyone; private apps are only visible to
+ * the developer who published them.
+ */
 async function getApp(req, res) {
   const app = await App.findById(req.params.id).populate("developer");
   if (!app) return res.status(404).json({ message: "App not found" });
-  res.json(toAppJSON(app));
+
+  if (app.visibility === "private") {
+    const isOwner = req.user && app.developer._id.toString() === req.user._id.toString();
+    if (!isOwner) return res.status(404).json({ message: "App not found" });
+  }
+
+  const reviewStats = await loadReviewStats([app._id]);
+  res.json(toAppJSON(app, reviewStats));
 }
 
 /**
@@ -153,7 +232,18 @@ async function deleteApp(req, res) {
   }
 
   await App.findByIdAndDelete(req.params.id);
+  await Review.deleteMany({ app: req.params.id });
   res.json({ message: "App deleted", id: req.params.id });
 }
 
-module.exports = { createApp, listApps, myApps, getApp, downloadApp, deleteApp };
+module.exports = {
+  createApp,
+  listApps,
+  listCategories,
+  myApps,
+  getApp,
+  downloadApp,
+  deleteApp,
+  toAppJSON,
+  loadReviewStats,
+};
