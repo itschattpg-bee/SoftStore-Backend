@@ -2,6 +2,7 @@ const path = require("path");
 const App = require("../models/App");
 const Review = require("../models/Review");
 const { publishAppRelease } = require("../services/githubService");
+const notificationService = require("../services/notificationService");
 const { formatBytes } = require("../utils/formatBytes");
 const { toProxiedUrl, toProxiedUrls } = require("../utils/mediaUrl");
 const { CATEGORIES } = require("../constants/categories");
@@ -82,6 +83,11 @@ async function createApp(req, res) {
   try {
     const { name, description, repoLink, category } = req.body;
     let { visibility } = req.body;
+    // Sent from the "notify everyone about this app?" prompt shown at
+    // publish time on the client. Comes through as a string on
+    // multipart/form-data ("true"/"false"), so compare loosely.
+    const notifyAllUsers =
+      req.body.notifyAllUsers === "true" || req.body.notifyAllUsers === true;
     const iconFile = req.files?.icon?.[0];
     const appFile = req.files?.appFile?.[0];
     const screenshotFiles = req.files?.screenshots || [];
@@ -146,6 +152,20 @@ async function createApp(req, res) {
     });
 
     await app.populate("developer");
+
+    // Fire-and-forget: don't make the developer wait on a fan-out push
+    // to every user before their upload finishes.
+    if (notifyAllUsers) {
+      notificationService
+        .notifyAllUsers({
+          title: "New app on SoftStore",
+          body: `${developer.name} just published "${app.name}"`,
+          data: { type: "new_app", appId: app._id.toString() },
+          excludeUserId: developer._id,
+        })
+        .catch((err) => console.error("notifyAllUsers (new app) failed:", err.message));
+    }
+
     res.status(201).json(toAppJSON(app));
   } catch (err) {
     console.error("createApp error:", err.message);
@@ -218,6 +238,59 @@ async function downloadApp(req, res) {
 }
 
 /**
+ * GET /api/apps/featured — the top 3 "featured" public apps.
+ *
+ * Ranking is a score, not a plain rating sort, because a raw average
+ * would let an app with a single 5-star review outrank one with a 4.0
+ * average backed by many ratings and downloads — exactly backwards from
+ * what "featured" should mean.
+ *
+ *   score = avgRating * log10(reviewsCount + downloads + 1)
+ *
+ * The log term is a "confidence" multiplier: it grows with both how
+ * many people rated the app and how many downloaded it, but with
+ * diminishing returns so one viral app with huge download counts can't
+ * dominate purely on volume — the rating itself still matters just as
+ * much. Example: 5★ from 1 review + 5 downloads scores lower than
+ * 4★ from 3 reviews + 10 downloads (3.9 vs 4.6), matching the intent
+ * that more people vouching for an app should count for something.
+ *
+ * Apps with zero reviews can't be scored on rating at all, so they're
+ * only used to pad the list out to 3 (ranked by downloads) if there
+ * aren't yet 3 rated public apps — this keeps the endpoint useful on a
+ * fresh/mostly-empty store instead of returning fewer than 3 results.
+ */
+async function featuredApps(req, res) {
+  const apps = await App.find({ visibility: "public" }).populate("developer");
+  if (!apps.length) return res.json([]);
+
+  const reviewStats = await loadReviewStats(apps.map((a) => a._id));
+
+  const scored = apps.map((app) => {
+    const stats = reviewStats.get(app._id.toString()) || {
+      avgRating: 0,
+      reviewsCount: 0,
+    };
+    const score =
+      stats.reviewsCount > 0
+        ? stats.avgRating * Math.log10(stats.reviewsCount + app.downloads + 1)
+        : 0;
+    return { app, stats, score };
+  });
+
+  const rated = scored
+    .filter((s) => s.stats.reviewsCount > 0)
+    .sort((a, b) => b.score - a.score);
+  const unrated = scored
+    .filter((s) => s.stats.reviewsCount === 0)
+    .sort((a, b) => b.app.downloads - a.app.downloads);
+
+  const top3 = [...rated, ...unrated].slice(0, 3);
+
+  res.json(top3.map(({ app }) => toAppJSON(app, reviewStats)));
+}
+
+/**
  * DELETE /api/apps/:id — removes an app listing. Only the developer who
  * published it can delete it. This only removes our DB record — the
  * actual release/assets stay on GitHub since that's the developer's own
@@ -244,6 +317,7 @@ module.exports = {
   getApp,
   downloadApp,
   deleteApp,
+  featuredApps,
   toAppJSON,
   loadReviewStats,
 };

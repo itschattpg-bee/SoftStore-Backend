@@ -7,6 +7,7 @@ const {
   getApp,
   downloadApp,
   deleteApp,
+  featuredApps,
 } = require("../controllers/appController");
 const {
   listReviews,
@@ -21,6 +22,7 @@ const router = express.Router();
 // Keep these fixed sub-paths above "/:id" so they aren't parsed as an app id.
 router.get("/mine", requireAuth, myApps);
 router.get("/categories", listCategories);
+router.get("/featured", featuredApps); // top 3 by rating+downloads, for the home screen
 
 router.get("/", listApps); // ?search=term&category=term for the home screen
 router.post("/", requireAuth, uploadAppAssets, createApp);

@@ -3,6 +3,7 @@ const express = require("express");
 const cors = require("cors");
 const morgan = require("morgan");
 const path = require("path");
+const mongoose = require("mongoose");
 
 const connectDB = require("./config/db");
 const authRoutes = require("./routes/authRoutes");
@@ -24,7 +25,22 @@ app.use(express.urlencoded({ extended: true }));
 // (like Render) after a restart.
 app.use("/uploads", express.static(path.join(__dirname, "..", "uploads")));
 
-app.get("/api/health", (req, res) => res.json({ ok: true }));
+// Health check — reports whether the API process is up AND whether it
+// can actually reach MongoDB, since a running process with a dead DB
+// connection is still "down" from the app's point of view. readyState:
+// 0 disconnected, 1 connected, 2 connecting, 3 disconnecting.
+const DB_STATES = ["disconnected", "connected", "connecting", "disconnecting"];
+app.get("/api/health", (req, res) => {
+  const dbState = mongoose.connection.readyState;
+  const dbConnected = dbState === 1;
+  res.status(dbConnected ? 200 : 503).json({
+    ok: dbConnected,
+    status: dbConnected ? "healthy" : "degraded",
+    db: DB_STATES[dbState] || "unknown",
+    uptimeSeconds: Math.round(process.uptime()),
+    timestamp: new Date().toISOString(),
+  });
+});
 
 app.use("/api/auth", authRoutes);
 app.use("/api/users", userRoutes);

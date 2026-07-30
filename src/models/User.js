@@ -57,6 +57,14 @@ const userSchema = new mongoose.Schema(
       // never sent to the client (see toPublicJSON below).
       accessToken: { type: String, default: null, select: false },
     },
+    // FCM registration tokens for every device this user is logged in
+    // on (one per device/install). Used to push notifications for new
+    // app uploads and new comments. Never sent to the client.
+    fcmTokens: {
+      type: [String],
+      default: [],
+      select: false,
+    },
   },
   { timestamps: true }
 );

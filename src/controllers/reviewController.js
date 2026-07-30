@@ -1,5 +1,6 @@
 const App = require("../models/App");
 const Review = require("../models/Review");
+const notificationService = require("../services/notificationService");
 
 function toReviewJSON(review) {
   const user = review.user;
@@ -52,11 +53,27 @@ async function upsertReview(req, res) {
     const app = await App.findById(req.params.id);
     if (!app) return res.status(404).json({ message: "App not found" });
 
+    // Only the very first comment on an app should notify its owner —
+    // not every time the same user edits their own review afterwards.
+    const existing = await Review.findOne({ app: req.params.id, user: req.user._id });
+
     const review = await Review.findOneAndUpdate(
       { app: req.params.id, user: req.user._id },
       { rating: ratingNum, comment: comment.trim() },
       { upsert: true, new: true, setDefaultsOnInsert: true }
     ).populate("user");
+
+    if (!existing && app.developer.toString() !== req.user._id.toString()) {
+      notificationService
+        .notifyUser(app.developer, {
+          title: "New comment on your app",
+          body: `${review.user?.name || "Someone"} commented on "${app.name}": ${comment
+            .trim()
+            .slice(0, 100)}`,
+          data: { type: "new_comment", appId: app._id.toString() },
+        })
+        .catch((err) => console.error("notifyUser (new comment) failed:", err.message));
+    }
 
     res.status(201).json(toReviewJSON(review));
   } catch (err) {

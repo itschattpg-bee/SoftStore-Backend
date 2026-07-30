@@ -1,6 +1,7 @@
 const jwt = require("jsonwebtoken");
 const User = require("../models/User");
 const App = require("../models/App");
+const Review = require("../models/Review");
 const {
   getAuthorizeUrl,
   exchangeCodeForToken,
@@ -9,9 +10,43 @@ const {
 const { JWT_SECRET } = require("../utils/jwt");
 const { fileToDataUri } = require("../utils/imageEncoding");
 
+/**
+ * Aggregates a developer's stats across every app they've published:
+ *  - totalDownloads: sum of each app's download counter
+ *  - avgRating: the mean of each *rated* app's own average rating
+ *    (e.g. 3 apps rated 4.0, 5.0 and 3.0 -> 4.0), matching how the
+ *    profile/download screens describe it. Apps with no reviews yet
+ *    don't drag this down or count toward it.
+ */
+async function loadDeveloperStats(userId) {
+  const apps = await App.find({ developer: userId }).select("_id downloads");
+  const totalDownloads = apps.reduce((sum, a) => sum + (a.downloads || 0), 0);
+  const appIds = apps.map((a) => a._id);
+
+  if (!appIds.length) {
+    return { appsCount: 0, totalDownloads: 0, avgRating: 0, ratedAppsCount: 0 };
+  }
+
+  const rows = await Review.aggregate([
+    { $match: { app: { $in: appIds } } },
+    { $group: { _id: "$app", avgRating: { $avg: "$rating" } } },
+  ]);
+
+  const avgRating = rows.length
+    ? Math.round((rows.reduce((sum, r) => sum + r.avgRating, 0) / rows.length) * 10) / 10
+    : 0;
+
+  return {
+    appsCount: apps.length,
+    totalDownloads,
+    avgRating,
+    ratedAppsCount: rows.length,
+  };
+}
+
 async function withAppsCount(user) {
-  const appsCount = await App.countDocuments({ developer: user._id });
-  return { ...user.toPublicJSON(), appsCount };
+  const stats = await loadDeveloperStats(user._id);
+  return { ...user.toPublicJSON(), ...stats };
 }
 
 /** GET /api/users/me — the logged in user's own profile. */
@@ -122,4 +157,40 @@ async function githubCallback(req, res) {
   }
 }
 
-module.exports = { getMe, getByUsername, updateMe, githubConnect, githubCallback };
+/**
+ * POST /api/users/me/fcm-token — call this once you have a device's FCM
+ * registration token (after the user grants notification permission).
+ * Body: { token: string }. Safe to call again with the same token.
+ */
+async function registerFcmToken(req, res) {
+  const { token } = req.body;
+  if (!token || typeof token !== "string") {
+    return res.status(400).json({ message: "token is required" });
+  }
+  await User.findByIdAndUpdate(req.user._id, { $addToSet: { fcmTokens: token } });
+  res.json({ message: "Token registered" });
+}
+
+/**
+ * DELETE /api/users/me/fcm-token — call this on logout (or whenever a
+ * token is invalidated client-side) so this device stops receiving
+ * push notifications for this account. Body: { token: string }.
+ */
+async function unregisterFcmToken(req, res) {
+  const { token } = req.body;
+  if (!token || typeof token !== "string") {
+    return res.status(400).json({ message: "token is required" });
+  }
+  await User.findByIdAndUpdate(req.user._id, { $pull: { fcmTokens: token } });
+  res.json({ message: "Token removed" });
+}
+
+module.exports = {
+  getMe,
+  getByUsername,
+  updateMe,
+  githubConnect,
+  githubCallback,
+  registerFcmToken,
+  unregisterFcmToken,
+};
