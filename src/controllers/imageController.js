@@ -110,6 +110,19 @@ async function fetchUpstreamImageWithRetry(targetUrl, maxRetries = 3) {
  * without CORS or socket hang up issues.
  */
 async function proxyImage(req, res) {
+  // Set CORS and Cross-Origin headers for all incoming requests (GET, HEAD, OPTIONS)
+  res.set("Access-Control-Allow-Origin", "*");
+  res.set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
+  res.set("Access-Control-Allow-Headers", "*");
+  res.set("Access-Control-Expose-Headers", "Content-Length, Content-Type, ETag");
+  res.set("Cross-Origin-Resource-Policy", "cross-origin");
+  res.set("Cross-Origin-Embedder-Policy", "unsafe-none");
+
+  // Respond immediately to OPTIONS preflight
+  if (req.method === "OPTIONS") {
+    return res.status(204).end();
+  }
+
   const { url } = req.query;
   if (!url || typeof url !== "string") {
     return res.status(400).json({ message: "url query param is required" });
@@ -134,11 +147,14 @@ async function proxyImage(req, res) {
     if (req.headers["if-none-match"] === cached.etag) {
       return res.status(304).end();
     }
-    res.set("Access-Control-Allow-Origin", "*");
     res.set("Cache-Control", "public, max-age=86400, immutable");
     res.set("Content-Type", cached.contentType);
     res.set("Content-Length", cached.contentLength);
     res.set("ETag", cached.etag);
+
+    if (req.method === "HEAD") {
+      return res.status(200).end();
+    }
     return res.status(200).send(cached.buffer);
   }
 
@@ -170,11 +186,14 @@ async function proxyImage(req, res) {
     if (req.headers["if-none-match"] === item.etag) {
       return res.status(304).end();
     }
-    res.set("Access-Control-Allow-Origin", "*");
     res.set("Cache-Control", "public, max-age=86400, immutable");
     res.set("Content-Type", item.contentType);
     res.set("Content-Length", item.contentLength);
     res.set("ETag", item.etag);
+
+    if (req.method === "HEAD") {
+      return res.status(200).end();
+    }
     return res.status(200).send(item.buffer);
   } catch (err) {
     console.error("proxyImage error:", err.message);

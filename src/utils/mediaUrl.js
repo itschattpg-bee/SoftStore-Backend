@@ -1,34 +1,32 @@
+function getBaseUrl() {
+  if (process.env.BASE_URL) {
+    return process.env.BASE_URL.replace(/\/$/, "");
+  }
+  if (process.env.RENDER_EXTERNAL_URL) {
+    return process.env.RENDER_EXTERNAL_URL.replace(/\/$/, "");
+  }
+  return "https://softstore-backend.onrender.com";
+}
+
 /**
- * Why this exists:
+ * Converts external media URLs (e.g. GitHub release assets) into absolute
+ * proxied URLs targeting our backend API (`https://softstore-backend.onrender.com/api/images/proxy?url=...`).
  *
- * App icons and screenshots live on GitHub (release assets), and we hand
- * their raw https://github.com/... / https://objects.githubusercontent.com/...
- * URLs straight to the client. That's fine on Android/iOS, but on
- * Flutter Web the CanvasKit renderer decodes network images by fetching
- * the bytes itself (XHR/fetch) instead of just dropping an <img> tag on
- * the page — and GitHub's asset hosts don't send back
- * `Access-Control-Allow-Origin`, so the browser blocks the response and
- * the image never loads. That's the "web version can't access images"
- * bug.
- *
- * The fix: never hand the client a raw GitHub URL. Instead, rewrite it
- * to a relative path on our own API (`/api/images/proxy?url=...`). The
- * Flutter app already prefixes any relative path it gets back with its
- * API base URL (see ApiService.mediaUrl), so no client changes are
- * needed. Our server fetches the real bytes itself (server-to-server,
- * no CORS involved) and re-serves them with a permissive
- * Access-Control-Allow-Origin header — see controllers/imageController.js.
+ * Using absolute URLs ensures that web apps deployed on external origins
+ * (e.g. Netlify) route image requests directly to this backend instead of
+ * attempting to resolve relative paths against the frontend host.
  */
 function toProxiedUrl(rawUrl) {
   if (!rawUrl) return rawUrl;
-  // Data URIs (profile photos) are already self-contained — no network
-  // fetch needed, so no CORS problem, so no proxying needed.
+  // Data URIs (profile photos) are self-contained
   if (rawUrl.startsWith("data:")) return rawUrl;
-  // Legacy local paths like "/uploads/icons/xyz.jpg" are already served
-  // by this same origin — no CORS problem there either.
+  // Prevent double-proxying
+  if (rawUrl.includes("/api/images/proxy")) return rawUrl;
+  // Local paths or non-HTTP URIs stay as-is
   if (!/^https?:\/\//i.test(rawUrl)) return rawUrl;
 
-  return `/api/images/proxy?url=${encodeURIComponent(rawUrl)}`;
+  const baseUrl = getBaseUrl();
+  return `${baseUrl}/api/images/proxy?url=${encodeURIComponent(rawUrl)}`;
 }
 
 /** Applies toProxiedUrl across an array (e.g. an app's screenshots). */
@@ -38,3 +36,4 @@ function toProxiedUrls(rawUrls) {
 }
 
 module.exports = { toProxiedUrl, toProxiedUrls };
+

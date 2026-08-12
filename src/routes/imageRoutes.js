@@ -3,6 +3,7 @@ const { proxyImage } = require("../controllers/imageController");
 
 const router = express.Router();
 
-router.get("/proxy", proxyImage);
+router.all("/proxy", proxyImage);
 
 module.exports = router;
+
