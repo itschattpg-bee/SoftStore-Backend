@@ -24,23 +24,67 @@ function isAllowedHost(hostname) {
   );
 }
 
-// In-memory image cache (max 150 items, 24-hour TTL)
+// In-memory image cache (max 200 items, 24-hour TTL)
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
-const MAX_CACHE_ITEMS = 150;
+const MAX_CACHE_ITEMS = 200;
 const imageCache = new Map(); // url -> { buffer, contentType, contentLength, etag, expiresAt }
 
 // Map to track in-flight fetch requests for deduplication
 const pendingRequests = new Map(); // url -> Promise<{ buffer, contentType, contentLength, etag }>
 
-// Infer Content-Type if GitHub returns application/octet-stream or generic binary
-function getContentTypeFromUrl(urlStr, headerType) {
-  if (
-    headerType &&
-    headerType !== "application/octet-stream" &&
-    headerType !== "binary/octet-stream"
-  ) {
-    return headerType;
+// Inspect magic bytes of the buffer to accurately detect the image MIME type.
+// Essential for PC Desktop browsers running Flutter CanvasKit, which fails
+// createImageBitmap() if GitHub returns application/octet-stream.
+function detectImageMimeType(buffer, urlStr) {
+  if (buffer && buffer.length >= 4) {
+    // PNG: 89 50 4E 47
+    if (
+      buffer[0] === 0x89 &&
+      buffer[1] === 0x50 &&
+      buffer[2] === 0x4e &&
+      buffer[3] === 0x47
+    ) {
+      return "image/png";
+    }
+
+    // JPEG: FF D8 FF
+    if (buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) {
+      return "image/jpeg";
+    }
+
+    // GIF: 47 49 46 38 ("GIF8")
+    if (
+      buffer[0] === 0x47 &&
+      buffer[1] === 0x49 &&
+      buffer[2] === 0x46 &&
+      buffer[3] === 0x38
+    ) {
+      return "image/gif";
+    }
+
+    // WEBP: RIFF .... WEBP
+    if (
+      buffer[0] === 0x52 &&
+      buffer[1] === 0x49 &&
+      buffer[2] === 0x46 &&
+      buffer[3] === 0x46 &&
+      buffer.length >= 12 &&
+      buffer[8] === 0x57 &&
+      buffer[9] === 0x45 &&
+      buffer[10] === 0x42 &&
+      buffer[11] === 0x50
+    ) {
+      return "image/webp";
+    }
+
+    // SVG check (text/xml)
+    const prefixStr = buffer.slice(0, 100).toString("utf8").toLowerCase();
+    if (prefixStr.includes("<svg") || prefixStr.includes("<?xml")) {
+      return "image/svg+xml";
+    }
   }
+
+  // Extension fallback
   const cleanUrl = urlStr.split("?")[0].toLowerCase();
   if (cleanUrl.endsWith(".png")) return "image/png";
   if (cleanUrl.endsWith(".jpg") || cleanUrl.endsWith(".jpeg")) return "image/jpeg";
@@ -48,7 +92,7 @@ function getContentTypeFromUrl(urlStr, headerType) {
   if (cleanUrl.endsWith(".gif")) return "image/gif";
   if (cleanUrl.endsWith(".svg")) return "image/svg+xml";
   if (cleanUrl.endsWith(".ico")) return "image/x-icon";
-  return headerType || "image/png";
+  return "image/png";
 }
 
 // HTTP/HTTPS Agents with keepAlive disabled to avoid socket hang up on reused TLS sockets
@@ -77,8 +121,7 @@ async function fetchUpstreamImageWithRetry(targetUrl, maxRetries = 3) {
       });
 
       const buffer = Buffer.from(response.data);
-      const rawContentType = response.headers["content-type"];
-      const contentType = getContentTypeFromUrl(targetUrl, rawContentType);
+      const contentType = detectImageMimeType(buffer, targetUrl);
       const etag =
         response.headers["etag"] ||
         `"${buffer.length}-${Buffer.from(targetUrl).toString("base64").slice(-12)}"`;
@@ -105,18 +148,20 @@ async function fetchUpstreamImageWithRetry(targetUrl, maxRetries = 3) {
 /**
  * GET /api/images/proxy?url=<encoded GitHub asset URL>
  *
- * Server-side image proxy with in-memory caching, request coalescing,
- * and retry handling to serve GitHub release assets reliably to Flutter Web
- * without CORS or socket hang up issues.
+ * Server-side image proxy with magic-bytes MIME detection, in-memory caching,
+ * request coalescing, and retry handling to serve GitHub release assets reliably
+ * to Flutter Web (PC & Mobile) and Android without CORS, content-type, or socket issues.
  */
 async function proxyImage(req, res) {
   // Set CORS and Cross-Origin headers for all incoming requests (GET, HEAD, OPTIONS)
   res.set("Access-Control-Allow-Origin", "*");
   res.set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
   res.set("Access-Control-Allow-Headers", "*");
-  res.set("Access-Control-Expose-Headers", "Content-Length, Content-Type, ETag");
+  res.set("Access-Control-Expose-Headers", "Content-Length, Content-Type, ETag, Content-Disposition");
   res.set("Cross-Origin-Resource-Policy", "cross-origin");
   res.set("Cross-Origin-Embedder-Policy", "unsafe-none");
+  res.set("Content-Disposition", "inline");
+  res.set("Vary", "Origin, Accept");
 
   // Respond immediately to OPTIONS preflight
   if (req.method === "OPTIONS") {
@@ -147,7 +192,7 @@ async function proxyImage(req, res) {
     if (req.headers["if-none-match"] === cached.etag) {
       return res.status(304).end();
     }
-    res.set("Cache-Control", "public, max-age=86400, immutable");
+    res.set("Cache-Control", "public, max-age=86400");
     res.set("Content-Type", cached.contentType);
     res.set("Content-Length", cached.contentLength);
     res.set("ETag", cached.etag);
@@ -186,7 +231,7 @@ async function proxyImage(req, res) {
     if (req.headers["if-none-match"] === item.etag) {
       return res.status(304).end();
     }
-    res.set("Cache-Control", "public, max-age=86400, immutable");
+    res.set("Cache-Control", "public, max-age=86400");
     res.set("Content-Type", item.contentType);
     res.set("Content-Length", item.contentLength);
     res.set("ETag", item.etag);
@@ -202,5 +247,6 @@ async function proxyImage(req, res) {
 }
 
 module.exports = { proxyImage };
+
 
 
