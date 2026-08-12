@@ -1,5 +1,4 @@
 const axios = require("axios");
-const https = require("https");
 
 // Only ever proxy through to hosts we actually put images on — this is a
 // simple allowlist so the proxy can't be abused as an open SSRF relay to
@@ -18,58 +17,69 @@ function isAllowedHost(hostname) {
   );
 }
 
-// Reuse connections instead of opening a fresh TLS handshake for every
-// single proxied image — GitHub resets a burst of brand-new sockets
-// arriving at once (that's the "socket hang up" errors in the logs).
-const githubAgent = new https.Agent({ keepAlive: true, maxSockets: 4 });
+// --- in-memory cache -------------------------------------------------
+// Why this exists: GitHub's release-asset CDN throttles a source that
+// re-requests the same asset repeatedly in a short window (confirmed by
+// testing — hitting the same handful of URLs over and over, even one at
+// a time with no concurrency, starts returning 503s). Without caching,
+// this proxy re-fetched every icon/screenshot from GitHub on *every*
+// page view from *every* user — the same small set of URLs, constantly.
+// Caching means each asset is fetched from GitHub once and then served
+// from memory until it expires.
+const CACHE_MAX_BYTES = 150 * 1024 * 1024; // ~150MB — safe headroom on a 512MB instance
+const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // matches the Cache-Control header sent to clients
 
-// Cap how many proxy fetches to GitHub run at the same time. A screen
-// with 6 screenshots + an icon fires 7 requests at once — queue them so
-// only a few are ever in flight together instead of all 7 hitting
-// GitHub in the same instant.
-const MAX_CONCURRENT = 3;
-let active = 0;
-const queue = [];
+const cache = new Map(); // url -> { buffer, contentType, size, expiresAt }
+let cacheBytes = 0;
 
-function runNext() {
-  if (active >= MAX_CONCURRENT || queue.length === 0) return;
-  active++;
-  const { task, resolve, reject } = queue.shift();
-  task()
-    .then(resolve, reject)
-    .finally(() => {
-      active--;
-      runNext();
-    });
+function cacheGet(url) {
+  const entry = cache.get(url);
+  if (!entry) return null;
+  if (Date.now() > entry.expiresAt) {
+    cache.delete(url);
+    cacheBytes -= entry.size;
+    return null;
+  }
+  cache.delete(url); // re-insert so Map iteration order stays LRU
+  cache.set(url, entry);
+  return entry;
 }
 
-function schedule(task) {
-  return new Promise((resolve, reject) => {
-    queue.push({ task, resolve, reject });
-    runNext();
-  });
+function cacheSet(url, buffer, contentType) {
+  const size = buffer.length;
+  if (size > CACHE_MAX_BYTES) return; // bigger than the whole cache — not worth caching
+  while (cacheBytes + size > CACHE_MAX_BYTES && cache.size > 0) {
+    const oldestKey = cache.keys().next().value; // Map preserves insertion order
+    const oldest = cache.get(oldestKey);
+    cache.delete(oldestKey);
+    cacheBytes -= oldest.size;
+  }
+  cache.set(url, { buffer, contentType, size, expiresAt: Date.now() + CACHE_TTL_MS });
+  cacheBytes += size;
 }
+// -----------------------------------------------------------------------
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// "socket hang up" / ECONNRESET here are transient — GitHub reset the
-// connection, not a real failure — so a quick retry usually succeeds
-// (this matches the logs: screenshot-0 succeeded right after -1 to -5
-// all failed).
+// GitHub's release CDN is inherently a bit flaky under repeated load —
+// retry a couple of times on the errors we actually saw (socket hang up
+// / ECONNRESET / 503) before giving up.
 async function fetchWithRetry(url, attempt = 1) {
   try {
     return await axios.get(url, {
-      responseType: "stream",
+      responseType: "arraybuffer",
       maxRedirects: 5,
       timeout: 10000,
-      httpsAgent: githubAgent,
       headers: { "User-Agent": "SoftStore-Backend" },
       validateStatus: (status) => status < 400,
     });
   } catch (err) {
-    const transient = err.message === "socket hang up" || err.code === "ECONNRESET";
+    const transient =
+      err.message === "socket hang up" ||
+      err.code === "ECONNRESET" ||
+      err.response?.status === 503;
     if (transient && attempt < 3) {
-      await sleep(250 * attempt);
+      await sleep(300 * attempt);
       return fetchWithRetry(url, attempt + 1);
     }
     throw err;
@@ -102,19 +112,26 @@ async function proxyImage(req, res) {
     return res.status(400).json({ message: "That host isn't allowed to be proxied" });
   }
 
+  res.set("Access-Control-Allow-Origin", "*");
+  res.set("Cache-Control", "public, max-age=86400");
+
+  const cached = cacheGet(url);
+  if (cached) {
+    res.set("Content-Type", cached.contentType);
+    res.set("Content-Length", cached.size);
+    return res.send(cached.buffer);
+  }
+
   try {
-    const upstream = await schedule(() => fetchWithRetry(url));
+    const upstream = await fetchWithRetry(url);
+    const buffer = Buffer.from(upstream.data);
+    const contentType = upstream.headers["content-type"] || "application/octet-stream";
 
-    res.set("Access-Control-Allow-Origin", "*");
-    res.set("Cache-Control", "public, max-age=86400");
-    if (upstream.headers["content-type"]) {
-      res.set("Content-Type", upstream.headers["content-type"]);
-    }
-    if (upstream.headers["content-length"]) {
-      res.set("Content-Length", upstream.headers["content-length"]);
-    }
+    cacheSet(url, buffer, contentType);
 
-    upstream.data.pipe(res);
+    res.set("Content-Type", contentType);
+    res.set("Content-Length", buffer.length);
+    res.send(buffer);
   } catch (err) {
     console.error("proxyImage error:", url, err.message);
     res.status(502).json({ message: "Failed to fetch the image" });
