@@ -47,6 +47,7 @@ async function proxyImage(req, res) {
     const upstream = await axios.get(url, {
       responseType: "stream",
       maxRedirects: 5,
+      timeout: 10000, // don't hang forever if GitHub is slow — fail fast so the client isn't left waiting
       headers: { "User-Agent": "SoftStore-Backend" },
       validateStatus: (status) => status < 400,
     });
@@ -62,7 +63,9 @@ async function proxyImage(req, res) {
 
     upstream.data.pipe(res);
   } catch (err) {
-    console.error("proxyImage error:", err.message);
+    // Log the URL along with the error so Render logs actually tell you
+    // which asset failed and why (timeout vs 404 vs network error, etc.)
+    console.error("proxyImage error:", url, err.message);
     res.status(502).json({ message: "Failed to fetch the image" });
   }
 }
